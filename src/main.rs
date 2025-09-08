@@ -13,6 +13,28 @@ use pcap::{Active, Capture, Device, Error, Packet, PacketCodec, PacketStream};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use prost::Message as ProtoMessage;
+
+mod proto {
+    include!(concat!(env!("OUT_DIR"), "/proto.rs"));
+}
+
+use crate::proto::WsFrame;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WsMode {
+    Raw,
+    Protobuf,
+}
+
+impl WsMode {
+    fn from_query(mode: Option<String>) -> Self {
+        match mode.as_deref() {
+            Some("protobuf") | Some("proto") | Some("pb") => WsMode::Protobuf,
+            _ => WsMode::Raw,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -24,6 +46,8 @@ struct Args {
 #[derive(serde::Deserialize)]
 struct QueryParams {
     filter: Option<String>,
+    // Optional mode toggle: "protobuf" enables protobuf encoding/decoding
+    mode: Option<String>,
 }
 
 pub struct RawBytesCodec;
@@ -52,7 +76,7 @@ async fn get_interfaces() -> Result<Json<Vec<String>>, (StatusCode, String)> {
 async fn ws_handler(
     ws: WebSocketUpgrade,
     Path(iface): Path<String>,
-    Query(QueryParams { filter }): Query<QueryParams>,
+    Query(params): Query<QueryParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if !has_interface(&iface) {
         return Err((
@@ -61,11 +85,13 @@ async fn ws_handler(
         ));
     }
 
+    let mode = WsMode::from_query(params.mode.clone());
+
     let device = Device::from(iface.as_str());
-    let stream = new_stream(device, filter.clone())
+    let stream = new_stream(device, params.filter.clone())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(ws.on_upgrade(move |socket| run_capture_over_ws(socket, stream)))
+    Ok(ws.on_upgrade(move |socket| run_capture_over_ws(socket, stream, mode)))
 }
 
 fn has_interface(name: &str) -> bool {
@@ -96,7 +122,11 @@ fn new_stream(
     cap.stream(RawBytesCodec)
 }
 
-async fn run_capture_over_ws(socket: WebSocket, mut stream: PacketStream<Active, RawBytesCodec>) {
+async fn run_capture_over_ws(
+    socket: WebSocket,
+    mut stream: PacketStream<Active, RawBytesCodec>,
+    mode: WsMode,
+) {
     // Split the websocket so we can read control frames while writing
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -105,6 +135,8 @@ async fn run_capture_over_ws(socket: WebSocket, mut stream: PacketStream<Active,
 
     // websocket -> pcap channel
     let (ws_to_pcap_tx, mut ws_to_pcap_rx) = mpsc::channel::<Bytes>(256);
+
+    let use_proto = matches!(mode, WsMode::Protobuf);
 
     // Task 1: Owns the pcap stream. Acts as a bridge between the pcap stream and the websocket.
     let mut reader = tokio::spawn(async move {
@@ -139,7 +171,19 @@ async fn run_capture_over_ws(socket: WebSocket, mut stream: PacketStream<Active,
     // Task 2: write messages to websocket (applies backpressure)
     let mut writer = tokio::spawn(async move {
         while let Some(bytes) = pcap_to_ws_rx.recv().await {
-            if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+            let msg = if use_proto {
+                let frame = WsFrame { payload: bytes.to_vec() };
+                let mut buf = Vec::with_capacity(frame.encoded_len());
+                if let Err(e) = frame.encode(&mut buf) {
+                    error!("Failed to encode protobuf frame: {}", e);
+                    continue;
+                }
+                Message::Binary(Bytes::from(buf))
+            } else {
+                Message::Binary(bytes)
+            };
+
+            if ws_tx.send(msg).await.is_err() {
                 error!("Failed to send packet to websocket");
                 break; // client disconnected
             }
@@ -155,7 +199,19 @@ async fn run_capture_over_ws(socket: WebSocket, mut stream: PacketStream<Active,
                     break;
                 }
                 Message::Binary(bytes) => {
-                    if ws_to_pcap_tx.send(bytes).await.is_err() {
+                    let out_bytes = if use_proto {
+                        match WsFrame::decode(bytes.as_ref()) {
+                            Ok(frame) => Bytes::from(frame.payload),
+                            Err(e) => {
+                                error!("Failed to decode protobuf frame: {}", e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        bytes
+                    };
+
+                    if ws_to_pcap_tx.send(out_bytes).await.is_err() {
                         break;
                     }
                 }

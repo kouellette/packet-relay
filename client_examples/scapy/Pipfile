@@ -6,6 +6,8 @@ name = "pypi"
 [packages]
 scapy = "*"
 websockets = "*"
+protobuf = "*"
+grpcio-tools = "*"
 
 [dev-packages]
 
